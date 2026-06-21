@@ -1,0 +1,16 @@
+{
+  "description": "Seeds the Council workflows into ~/.claude/workflows on a machine where they are missing, so the skills can invoke them by name.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/sync-workflows.mjs\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

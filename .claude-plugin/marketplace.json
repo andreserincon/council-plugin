@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "council",
+  "description": "The Council: an end-to-end product pipeline of committed-perspective review boards and gated builders. Decide, spec, build, and polish any app, each stage run by seats that debate and adversarially verify before anything ships.",
+  "owner": {
+    "name": "Andres Rincon"
+  },
+  "plugins": [
+    {
+      "name": "council",
+      "description": "The Council: ui-board (design review), business-council (venture and requirements), forge (test-gated build of new behavior), and facelift (behavior-preserving reskin), with their adversarial verify and analyze gates. Domain-agnostic; works on any app.",
+      "author": {
+        "name": "Andres Rincon"
+      },
+      "source": "./plugins/council",
+      "category": "development"
+    }
+  ]
+}
