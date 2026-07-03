@@ -12,7 +12,17 @@ In Claude Code, add this marketplace and install the plugin (use the `/plugin` c
    - Local: add the marketplace from the path to this repository.
    - Remote: push this repository to GitHub, then add the marketplace from the GitHub URL. This is what makes the Council available on other machines and in cloud or headless sessions.
 2. Install the `council` plugin from the `council` marketplace.
-3. Start a new session. The SessionStart hook seeds the workflows into `~/.claude/workflows` if they are not already there. The skills (`ui-board`, `business-council`, `forge`, `facelift`) become available as slash commands and by natural request.
+3. Start a new session. The SessionStart hook seeds the workflows into `~/.claude/workflows`. The skills (`ui-board`, `business-council`, `forge`, `facelift`) and the `/council` router become available as slash commands and by natural request.
+
+## Updating
+
+When a new version is pushed to this repository, an existing install picks it up like this:
+
+1. Refresh the marketplace from its source: `claude plugin marketplace update council` (re-pulls from GitHub).
+2. Apply the new version: `claude plugin update council@council`.
+3. Restart Claude Code.
+
+The SessionStart hook is version-aware: on a version change it re-syncs the plugin's workflows into `~/.claude/workflows`, so workflow changes (not just skills and commands) reach existing installs. When the version is unchanged it does nothing, so it never clobbers a local edit on every session.
 
 ## What you get
 

@@ -42,6 +42,12 @@ if (!target) {
 }
 const platform = input.platform || 'web'
 const directionCount = Math.max(2, Math.min(3, input.directions || 3))
+// Fan-out throttle and verify controls (see business-council for the rationale).
+const maxConcurrency = Math.max(1, Math.min(16, input.maxConcurrency || 4))
+// verify: 'full' (default), 'lite' (P0 only, grounding only), 'off' (skip, all unverified).
+const verifyMode = (input.verify === 'lite' || input.verify === 'off') ? input.verify : 'full'
+const maxVerify = Math.max(1, Math.min(80, input.maxVerify || 24))
+const maxBatchSize = Math.max(1, Math.min(20, input.maxBatchSize || 8))
 // Where preview HTML files are written. Must be OUTSIDE the user's repo.
 const scratchHint = input.scratchDir ||
   'a folder named ui-board-previews inside the OS temp directory or the user home directory (never inside the project repo)'
@@ -83,6 +89,18 @@ if (confirmedBrief && (typeof confirmedBrief !== 'object' || Array.isArray(confi
 
 // ---- Small helpers -------------------------------------------------------------
 const norm = (s) => String(s || '').toLowerCase().trim()
+// Bounded fan-out: at most `limit` agents in flight at once, in order. Keeps the
+// verify batches under the server throttle. Kept in sync with business-council.js.
+const mapLimit = async (items, limit, fn) => {
+  const out = []
+  const n = Math.max(1, limit)
+  for (let i = 0; i < items.length; i += n) {
+    const wave = items.slice(i, i + n)
+    const res = await parallel(wave.map((it, j) => () => fn(it, i + j)))
+    out.push(...res)
+  }
+  return out
+}
 const sameSurface = (a, b) => {
   const x = norm(a)
   const y = norm(b)
@@ -448,60 +466,144 @@ const rebuttals = (await parallel(seats.map((sr) => () =>
   )
 ))).filter(Boolean)
 
-// ---- Stage 2, Verify (adversarial check of every P0/P1 before the punch list) -
-phase('Verify')
-const verifyOne = (f, lens, phaseName) => agent(
-  `Adversarially verify a UI Board finding. Your job is to try to REFUTE it; if the evidence is not actually there, ` +
-  `say refuted=true. Do not be agreeable.\n` +
-  `Lens: ${lens}.\n` +
-  `Finding (${f.severity}, from the ${f.seat} seat, surface "${f.surface}"): ${f.finding}\n` +
-  `Claimed evidence: ${f.evidence}\n` +
-  `Proposed fix: ${f.fix}\n` +
-  `Brief: ${JSON.stringify(brief)}\n` +
-  `Source files: ${JSON.stringify(briefFiles)}\n` +
-  `Screenshots: ${JSON.stringify(visuals.screenshotPaths)}\n` +
-  `Read the actual files and screenshots yourself. ` +
-  (lens === 'fix feasibility'
-    ? `Check that the proposed fix is concretely expressible in the real stack named in the brief, at reasonable effort.`
-    : `Check that the problem actually exists as described, where described.`) +
-  ` Never edit code, never start servers or preview tools.`,
-  { schema: VERDICT_SCHEMA, label: `verify:${f.severity}:${String(f.finding || '').slice(0, 40)}`, phase: phaseName || 'Verify' }
-)
-
-const judgeSurvival = (f, verdicts) => {
-  const vs = verdicts.filter(Boolean)
-  if (!vs.length) return { ...f, survived: true, verifyNote: 'verifier agent failed; finding passes UNVERIFIED' }
-  const observationRefuted = vs.some((v) => v.lens !== 'fix feasibility' && v.refuted)
-  const feasibilityRefuted = vs.some((v) => v.lens === 'fix feasibility' && v.refuted)
-  if (observationRefuted) return { ...f, survived: false, verifyNote: vs.map((v) => v.note).join(' | ') }
-  if (feasibilityRefuted) return { ...f, survived: true, fixNeedsRework: true, verifyNote: vs.map((v) => v.note).join(' | ') }
-  return { ...f, survived: true, verifyNote: vs.map((v) => v.note).join(' | ') }
+// ---- Shared batched verifier ---------------------------------------------------
+// KEEP THIS BLOCK BYTE-IDENTICAL in ui-board.js and business-council.js (the
+// runtime has no import mechanism). It replaces the old one-agent-per-finding
+// verifier: findings are grouped by area and one agent verifies a whole area in a
+// single pass (reading its sources once), returning a two-flag verdict per finding
+// mapped back by stable fid. This preserves the exact drop-vs-rescope survival
+// semantics at a fraction of the token cost.
+const prioRank = (p) => (p === 'P0' ? 0 : p === 'P1' ? 1 : p === 'P2' ? 2 : 3)
+const coalesceFindings = (arr, stmtOf, prioOf) => {
+  const byKey = new Map()
+  let merged = 0
+  arr.forEach((f) => {
+    const k = norm(stmtOf(f)).replace(/[^a-z0-9]+/g, ' ').trim()
+    const cur = byKey.get(k)
+    if (!cur) { byKey.set(k, f); return }
+    merged++
+    if (prioRank(prioOf(f)) < prioRank(prioOf(cur))) byKey.set(k, f)
+  })
+  if (merged) log(`Coalesced ${merged} near-duplicate finding(s) before verify.`)
+  return Array.from(byKey.values())
+}
+const BATCH_VERDICT_SCHEMA = {
+  type: 'object',
+  required: ['verdicts'],
+  properties: {
+    verdicts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['fid', 'groundingRefuted', 'feasibilityRefuted', 'confidence', 'note'],
+        properties: {
+          fid: { type: 'string', description: 'Echo the finding fid exactly.' },
+          groundingRefuted: { type: 'boolean', description: 'True if the cited evidence does not actually support this finding for this specific target. Drops the finding.' },
+          feasibilityRefuted: { type: 'boolean', description: 'True if it is not realistically buildable/expressible with a reachable data path. Keeps the finding but marks it for rescope.' },
+          confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+          note: { type: 'string', description: 'What was checked and found.' },
+        },
+      },
+    },
+  },
+}
+// items: [{ fid, area, priority, statement, evidence, fix, seat, orig }]
+// cfg: { subject, phaseName, keptFlag, maxBatchSize, buildContext(area, batch) }
+const verifyByArea = async (items, cfg) => {
+  const survivors = []
+  const dropped = []
+  if (!items.length) return { survivors, dropped, unverifiedByOmission: 0 }
+  const groups = new Map()
+  items.forEach((it) => {
+    const key = norm(it.area) || 'general'
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(it)
+  })
+  const batches = []
+  groups.forEach((arr, area) => {
+    for (let i = 0; i < arr.length; i += cfg.maxBatchSize) batches.push({ area, batch: arr.slice(i, i + cfg.maxBatchSize) })
+  })
+  log(`Verify: ${items.length} finding(s) in ${batches.length} area-batch(es), ${maxConcurrency} at a time.`)
+  const results = await mapLimit(batches, maxConcurrency, ({ area, batch }) =>
+    agent(
+      `Adversarially verify a set of ${cfg.subject} findings, ALL in the area "${area}". Try to REFUTE each; do not be agreeable.\n` +
+      `For EACH finding run BOTH checks independently:\n` +
+      `  - grounding: does the cited evidence actually support THIS finding for THIS specific target (not in general), and is it not already made moot by prior art, a competitor, or the existing design? If it fails, set groundingRefuted true (the finding is DROPPED).\n` +
+      `  - feasibility: is it realistic for the stated builder and stack with a reachable data path, or concretely expressible in the real stack at reasonable effort? If it fails, set feasibilityRefuted true (the finding is KEPT but must be rescoped).\n` +
+      cfg.buildContext(area, batch) +
+      `\nFindings to verify (return exactly one verdict per fid, echoing the fid): ` +
+      JSON.stringify(batch.map((it) => ({ fid: it.fid, statement: it.statement, evidence: it.evidence, proposedFix: it.fix, priority: it.priority, seat: it.seat }))) + `\n` +
+      `Read the relevant source files or open cited sources ONCE for this area and reuse across the findings. Read-only: never edit anything, never start servers or preview tools.\n` +
+      `Return a verdict for EVERY fid above.`,
+      { schema: BATCH_VERDICT_SCHEMA, label: `verify:${String(area).slice(0, 24)}:${batch.length}`, phase: cfg.phaseName }
+    ).then((res) => ({ verdicts: (res && Array.isArray(res.verdicts)) ? res.verdicts : [] }))
+  )
+  const byFid = new Map()
+  results.filter(Boolean).forEach((r) => r.verdicts.forEach((v) => { if (v && v.fid != null) byFid.set(String(v.fid), v) }))
+  let omissions = 0
+  items.forEach((it) => {
+    const v = byFid.get(String(it.fid))
+    if (!v) {
+      omissions++
+      survivors.push({ ...it.orig, survived: true, verifyNote: 'verifier batch failed or omitted this finding; passes UNVERIFIED' })
+    } else if (v.groundingRefuted) {
+      dropped.push({ ...it.orig, survived: false, verifyNote: v.note || 'grounding refuted' })
+    } else if (v.feasibilityRefuted) {
+      const s = { ...it.orig, survived: true, verifyNote: v.note || 'feasibility refuted; rescope' }
+      s[cfg.keptFlag] = true
+      survivors.push(s)
+    } else {
+      survivors.push({ ...it.orig, survived: true, verifyNote: v.note || 'survived verification' })
+    }
+  })
+  if (omissions) log(`Verify: ${omissions} finding(s) passed UNVERIFIED (batch failure or omission).`)
+  return { survivors, dropped, unverifiedByOmission: omissions }
 }
 
-const toVerify = []
-seats.forEach((sr) => (sr.findings || []).forEach((f) => {
-  if (f.severity === 'P0' || f.severity === 'P1') toVerify.push({ seat: sr.seat, ...f })
-}))
-log(`Adversarially verifying ${toVerify.length} P0/P1 findings; P2/P3 pass through unverified.`)
+// ---- Stage 2, Verify (batched adversarial check before the punch list) ---------
+phase('Verify')
+// Compact context. The screenshots and source files stay (reading them IS the
+// verification); only the full brief is trimmed to its summary.
+const uiVerifyContext = () =>
+  `Brief summary: ${brief.summary}\n` +
+  `Stack: ${brief.stack}\n` +
+  `Source files to read for this area: ${JSON.stringify(briefFiles)}\n` +
+  `Screenshots to open: ${JSON.stringify(visuals.screenshotPaths)}\n` +
+  `Visual mode: ${visuals.mode}. Visual description: ${visuals.description}\n` +
+  mandateBlock
 
-const verifiedHighs = (await parallel(toVerify.map((f) => () => {
-  if (f.severity === 'P0') {
-    return parallel([
-      () => verifyOne(f, 'observation correctness').then((v) => v && { ...v, lens: 'observation correctness' }),
-      () => verifyOne(f, 'fix feasibility').then((v) => v && { ...v, lens: 'fix feasibility' }),
-    ]).then((vs) => judgeSurvival(f, vs))
-  }
-  return verifyOne(f, 'observation correctness and fix feasibility')
-    .then((v) => judgeSurvival(f, v ? [{ ...v, lens: 'combined' }] : []))
-}))).filter(Boolean)
-
+const highs = []
 const passThroughs = []
 seats.forEach((sr) => (sr.findings || []).forEach((f) => {
-  if (f.severity === 'P2' || f.severity === 'P3') passThroughs.push({ seat: sr.seat, ...f, survived: true, verifyNote: 'pass-through, not verified (P2/P3)' })
+  if (f.severity === 'P0' || f.severity === 'P1') highs.push({ seat: sr.seat, ...f })
+  else passThroughs.push({ seat: sr.seat, ...f, survived: true, verifyNote: 'pass-through, not verified (P2/P3)' })
 }))
-let survivors = verifiedHighs.filter((f) => f.survived).concat(passThroughs)
-let dropped = verifiedHighs.filter((f) => !f.survived)
-log(`Verification: ${verifiedHighs.length - dropped.length} of ${toVerify.length} P0/P1 findings survived; ${dropped.length} refuted and dropped.`)
+
+let survivors
+let dropped
+if (verifyMode === 'off') {
+  survivors = highs.map((f) => ({ ...f, survived: true, verifyNote: 'verification SKIPPED (verify=off); this finding is UNVERIFIED' })).concat(passThroughs)
+  dropped = []
+  log(`Verify OFF: ${highs.length} P0/P1 finding(s) pass through UNVERIFIED.`)
+} else {
+  let toVerify = highs
+  const notVerified = []
+  if (verifyMode === 'lite') {
+    toVerify = highs.filter((f) => f.severity === 'P0')
+    highs.filter((f) => f.severity !== 'P0').forEach((f) => notVerified.push({ ...f, survived: true, verifyNote: 'verify=lite: P1 not verified (UNVERIFIED)' }))
+  }
+  toVerify = coalesceFindings(toVerify, (f) => f.finding, (f) => f.severity)
+  if (toVerify.length > maxVerify) {
+    toVerify.sort((a, b) => prioRank(a.severity) - prioRank(b.severity))
+    toVerify.slice(maxVerify).forEach((f) => notVerified.push({ ...f, survived: true, verifyNote: 'over maxVerify cap; UNVERIFIED' }))
+    toVerify = toVerify.slice(0, maxVerify)
+  }
+  const items = toVerify.map((f, i) => ({ fid: 'F' + i, area: f.surface, priority: f.severity, statement: f.finding, evidence: f.evidence, fix: f.fix, seat: f.seat, orig: f }))
+  const res = await verifyByArea(items, { subject: 'UI Board', phaseName: 'Verify', keptFlag: 'fixNeedsRework', maxBatchSize, buildContext: uiVerifyContext })
+  survivors = res.survivors.concat(passThroughs).concat(notVerified)
+  dropped = res.dropped
+}
+log(`Verification: ${dropped.length} P0/P1 finding(s) refuted and dropped.`)
 
 // ---- Stage 2, Coverage (plain-code guard; targeted follow-ups for gaps) -------
 phase('Coverage')
@@ -527,12 +629,14 @@ if (gaps.length) {
     if (f.severity === 'P0' || f.severity === 'P1') followupHighs.push({ seat: `${sr.seat} (follow-up)`, ...f })
     else survivors.push({ seat: `${sr.seat} (follow-up)`, ...f, survived: true, verifyNote: 'pass-through, not verified (P2/P3)' })
   }))
-  const followupVerified = (await parallel(followupHighs.map((f) => () =>
-    verifyOne(f, 'observation correctness and fix feasibility', 'Coverage')
-      .then((v) => judgeSurvival(f, v ? [{ ...v, lens: 'combined' }] : []))
-  ))).filter(Boolean)
-  survivors = survivors.concat(followupVerified.filter((f) => f.survived))
-  dropped = dropped.concat(followupVerified.filter((f) => !f.survived))
+  if (followupHighs.length && verifyMode !== 'off') {
+    const fitems = followupHighs.map((f, i) => ({ fid: 'C' + i, area: f.surface, priority: f.severity, statement: f.finding, evidence: f.evidence, fix: f.fix, seat: f.seat, orig: f }))
+    const fres = await verifyByArea(fitems, { subject: 'UI Board', phaseName: 'Coverage', keptFlag: 'fixNeedsRework', maxBatchSize, buildContext: uiVerifyContext })
+    survivors = survivors.concat(fres.survivors)
+    dropped = dropped.concat(fres.dropped)
+  } else {
+    followupHighs.forEach((f) => survivors.push({ ...f, survived: true, verifyNote: verifyMode === 'off' ? 'verify=off; UNVERIFIED' : 'follow-up unverified' }))
+  }
 } else {
   log('Coverage: every surface was covered in the first round.')
 }

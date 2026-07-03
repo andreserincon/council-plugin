@@ -1,40 +1,57 @@
-// SessionStart seed hook for the Council plugin.
+// SessionStart sync hook for the Council plugin.
 //
 // The Council skills invoke their workflows BY NAME via the Workflow tool, which
-// resolves names from the user's ~/.claude/workflows folder. A plugin has no
-// auto-discovery slot for saved workflows, so on a machine where the plugin is
-// installed but the workflows are not yet present, this hook seeds them.
+// resolves names from ~/.claude/workflows. A plugin has no auto-discovery slot for
+// saved workflows, so this hook keeps them in sync from the plugin.
 //
-// COPY-IF-MISSING ONLY. It never overwrites an existing file, so on a machine
-// where ~/.claude/workflows is the canonical, hand-edited source (the author's
-// own setup), this hook is a harmless no-op and cannot revert local edits.
+// VERSION-AWARE SYNC. It copies the plugin's workflows (and the constitution
+// template) into ~/.claude only when the plugin version changed since the last
+// sync, tracked by a marker file. So:
+//   - fresh install: seeds everything;
+//   - plugin update to a new version: OVERWRITES with the new files, so workflow
+//     changes actually reach existing installs (a plain copy-if-missing hook would
+//     silently leave the old workflows in place);
+//   - same version on later sessions: no-op, so it never clobbers every session and
+//     never fights a same-version local edit.
 //
-// Non-fatal by design: if ~/.claude is not writable (headless or read-only
-// environments), it logs and exits 0 so it never blocks session start. In that
-// case a skill can still run a workflow by scriptPath at
-// ${CLAUDE_PLUGIN_ROOT}/workflows/<name>.js.
+// Non-fatal by design: if ~/.claude is not writable (headless or read-only), it
+// logs and exits 0 so it never blocks session start.
 
-import { cpSync, mkdirSync, readdirSync, existsSync } from 'node:fs'
+import { cpSync, mkdirSync, readdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = process.env.CLAUDE_PLUGIN_ROOT || dirname(dirname(fileURLToPath(import.meta.url)))
 const home = homedir()
+const wfDst = join(home, '.claude', 'workflows')
+const marker = join(wfDst, '.council-plugin-version')
 
-const seedDir = (srcDir, dstDir, filter) => {
+const readVersion = () => {
+  try { return JSON.parse(readFileSync(join(root, '.claude-plugin', 'plugin.json'), 'utf8')).version || '0' }
+  catch (e) { return '0' }
+}
+const readMarker = () => {
+  try { return existsSync(marker) ? readFileSync(marker, 'utf8').trim() : null }
+  catch (e) { return null }
+}
+const copyDir = (srcDir, dstDir, filter) => {
   if (!existsSync(srcDir)) return
   mkdirSync(dstDir, { recursive: true })
   for (const f of readdirSync(srcDir)) {
     if (filter && !filter(f)) continue
-    const dst = join(dstDir, f)
-    if (!existsSync(dst)) cpSync(join(srcDir, f), dst) // never overwrite
+    cpSync(join(srcDir, f), join(dstDir, f)) // overwrite
   }
 }
 
 try {
-  seedDir(join(root, 'workflows'), join(home, '.claude', 'workflows'), (f) => f.endsWith('.js'))
-  seedDir(join(root, 'templates'), join(home, '.claude', 'templates'), null)
+  const pluginVersion = readVersion()
+  if (readMarker() !== pluginVersion) {
+    copyDir(join(root, 'workflows'), wfDst, (f) => f.endsWith('.js'))
+    copyDir(join(root, 'templates'), join(home, '.claude', 'templates'), null)
+    mkdirSync(wfDst, { recursive: true })
+    writeFileSync(marker, pluginVersion)
+  }
 } catch (e) {
-  console.error('council: workflow seed skipped (non-fatal):', e && e.message)
+  console.error('council: workflow sync skipped (non-fatal):', e && e.message)
 }

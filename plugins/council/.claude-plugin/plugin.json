@@ -1,6 +1,6 @@
 {
   "name": "council",
-  "version": "1.3.0",
+  "version": "1.4.1",
   "description": "The Council: a pipeline of committed-perspective boards and gated builders that decide, spec, build, and polish any app. Includes a council router front door plus ui-board, business-council, forge, and facelift skills and their workflows and verify gates.",
   "author": {
     "name": "Andres Rincon"
